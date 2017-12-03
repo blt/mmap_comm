@@ -1,0 +1,11 @@
+[package]
+name = "mmap_comm"
+version = "0.1.0"
+authors = ["Brian L. Troutwine <brian@troutwine.us>"]
+
+[dependencies]
+lazy_static = "1.0"
+memmap = "0.6"
+rand = "0.3"
+byteorder = "1.2"
+
