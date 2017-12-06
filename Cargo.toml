@@ -8,4 +8,4 @@ lazy_static = "1.0"
 memmap = "0.6"
 rand = "0.3"
 byteorder = "1.2"
-
+coco = "0.3"
