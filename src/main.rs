@@ -13,7 +13,6 @@ use std::io::{Cursor, Seek, SeekFrom, Write};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 lazy_static! {
-    static ref TOTAL_SENDERS: sync::Arc<AtomicUsize> = sync::Arc::new(AtomicUsize::new(0));
     static ref VALUES_TO_READ: sync::Arc<AtomicUsize> = sync::Arc::new(AtomicUsize::new(0));
     static ref SENDER_Q: coco::Stack<Action> = coco::Stack::new();
     static ref RECEIVER_Q: coco::Stack<Action> = coco::Stack::new();
@@ -44,6 +43,27 @@ impl Action {
     }
 }
 
+pub fn delay(attempts: u32) -> Result<usize, ()> {
+    use std::time;
+    let delay = match attempts {
+        0 => 0,
+        1 => 1,
+        2 => 4,
+        3 => 8,
+        4 => 16,
+        5 => 32,
+        6 => 64,
+        7 => 128,
+        8 => 256,
+        9 => 512,
+        10 => return Err(()),
+        _ => unreachable!(),
+    };
+    let sleep_time = time::Duration::from_millis(delay as u64);
+    thread::sleep(sleep_time);
+    Ok(delay)
+}
+
 fn receiver() -> u64 {
     let path: PathBuf = PathBuf::from(PATH);
     let file = fs::OpenOptions::new()
@@ -60,6 +80,7 @@ fn receiver() -> u64 {
     let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::with_capacity(8));
     buf.seek(SeekFrom::Start(0)).unwrap();
 
+    let mut attempts = 0;
     loop {
         while VALUES_TO_READ.load(Ordering::SeqCst) != 0 {
             buf.seek(SeekFrom::Start(0)).unwrap();
@@ -76,10 +97,10 @@ fn receiver() -> u64 {
 
             VALUES_TO_READ.fetch_sub(1, Ordering::SeqCst);
         }
-        // TODO this synchronization is crummy and totally racey. Fun race
-        // though.
-        if TOTAL_SENDERS.load(Ordering::SeqCst) == 0 {
+        if let Err(_) = delay(attempts) {
             break;
+        } else {
+            attempts += 1;
         }
     }
     summation
@@ -95,8 +116,6 @@ fn sender() -> u64 {
         .unwrap();
     file.set_len((mem::size_of::<u64>() * CAP) as u64).unwrap();
     let mut mmap = unsafe { memmap::MmapMut::map_mut(&file).unwrap() };
-
-    TOTAL_SENDERS.fetch_add(1, Ordering::SeqCst);
 
     let mut rng = rand::thread_rng();
 
@@ -121,8 +140,6 @@ fn sender() -> u64 {
         VALUES_TO_READ.fetch_add(1, Ordering::SeqCst);
         idx += 1;
     }
-
-    TOTAL_SENDERS.fetch_sub(1, Ordering::SeqCst);
 
     summation
 }
