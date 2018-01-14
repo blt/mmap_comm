@@ -1,49 +1,30 @@
 extern crate byteorder;
-extern crate coco;
+extern crate clap;
 #[macro_use]
 extern crate lazy_static;
 extern crate memmap;
+extern crate parking_lot;
+extern crate quantiles;
 extern crate rand;
 
-use std::{fs, mem, sync, thread};
+use parking_lot::Mutex;
+use std::{fs, mem, panic, sync, thread, time};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::path::PathBuf;
 use rand::Rng;
+use clap::{App, Arg, ArgGroup};
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use quantiles::ckms::CKMS;
 
 lazy_static! {
     static ref VALUES_TO_READ: sync::Arc<AtomicUsize> = sync::Arc::new(AtomicUsize::new(0));
-    static ref SENDER_Q: coco::Stack<Action> = coco::Stack::new();
-    static ref RECEIVER_Q: coco::Stack<Action> = coco::Stack::new();
 }
 
-static CAP: usize = 10_000;
 static PATH: &'static str = "/tmp/mmap_comm";
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Action {
-    Write { offset: usize, val: u64 },
-    Read { offset: usize, val: u64 },
-}
-
-impl Action {
-    fn is_write(&self) -> bool {
-        match *self {
-            Action::Write { .. } => true,
-            _ => false,
-        }
-    }
-
-    fn is_read(&self) -> bool {
-        match *self {
-            Action::Read { .. } => true,
-            _ => false,
-        }
-    }
-}
-
-pub fn delay(attempts: u32) -> Result<usize, ()> {
+pub fn delay(attempts: u32) -> () {
     use std::time;
     let delay = match attempts {
         0 => 0,
@@ -51,20 +32,13 @@ pub fn delay(attempts: u32) -> Result<usize, ()> {
         2 => 4,
         3 => 8,
         4 => 16,
-        5 => 32,
-        6 => 64,
-        7 => 128,
-        8 => 256,
-        9 => 512,
-        10 => return Err(()),
-        _ => unreachable!(),
+        _ => 32,
     };
     let sleep_time = time::Duration::from_millis(delay as u64);
     thread::sleep(sleep_time);
-    Ok(delay)
 }
 
-fn receiver() -> u64 {
+fn receiver(cap: usize) -> (u64, u64) {
     let path: PathBuf = PathBuf::from(PATH);
     let file = fs::OpenOptions::new()
         .read(true)
@@ -72,41 +46,48 @@ fn receiver() -> u64 {
         .create(true)
         .open(&path)
         .unwrap();
-    file.set_len((mem::size_of::<u64>() * CAP) as u64).unwrap();
+    file.set_len((mem::size_of::<u64>() * cap) as u64).unwrap();
     let mmap = unsafe { memmap::MmapMut::map_mut(&file).unwrap() };
 
+    let mut total_read = 0;
     let mut summation: u64 = 0;
     let mut offset = 0;
     let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::with_capacity(8));
     buf.seek(SeekFrom::Start(0)).unwrap();
 
     let mut attempts = 0;
-    loop {
-        while VALUES_TO_READ.load(Ordering::SeqCst) != 0 {
+    let sz = mem::size_of::<u64>();
+    while total_read < cap {
+        let mut values_to_read = VALUES_TO_READ.load(Ordering::Relaxed);
+        let vtr_sub = values_to_read;
+        while values_to_read != 0 {
+            attempts = 0;
             buf.seek(SeekFrom::Start(0)).unwrap();
-            buf.write_all(&mmap[offset..offset + 8]).unwrap();
+            buf.write_all(&mmap[offset..offset + sz]).unwrap();
             buf.seek(SeekFrom::Start(0)).unwrap();
-            offset += 8;
+            offset += sz;
 
             let val = buf.read_u64::<BigEndian>().unwrap();
-            RECEIVER_Q.push(Action::Read {
-                offset: offset - 8,
-                val: val,
-            });
+            assert!(0 != val);
             summation += val;
-
-            VALUES_TO_READ.fetch_sub(1, Ordering::SeqCst);
+            total_read += 1;
+            values_to_read -= 1;
         }
-        if let Err(_) = delay(attempts) {
-            break;
-        } else {
-            attempts += 1;
+        if vtr_sub != 0 {
+            VALUES_TO_READ.fetch_sub(vtr_sub, Ordering::AcqRel);
         }
+        delay(attempts);
+        attempts += 1;
     }
-    summation
+    (total_read as u64, summation)
 }
 
-fn sender() -> u64 {
+struct SenderControl {
+    offset: usize,
+    unflushed_writes: usize,
+}
+
+fn sender(cap: usize, sender_cap: usize, lock: sync::Arc<Mutex<SenderControl>>) -> (u64, u64) {
     let path: PathBuf = PathBuf::from(PATH);
     let file = fs::OpenOptions::new()
         .read(true)
@@ -114,85 +95,86 @@ fn sender() -> u64 {
         .create(true)
         .open(&path)
         .unwrap();
-    file.set_len((mem::size_of::<u64>() * CAP) as u64).unwrap();
+    file.set_len((mem::size_of::<u64>() * cap) as u64).unwrap();
     let mut mmap = unsafe { memmap::MmapMut::map_mut(&file).unwrap() };
 
     let mut rng = rand::thread_rng();
 
-    let mut offset = 0;
+    let flush_limit = 1_000;
+
+    let mut total_written: usize = 0;
     let mut idx = 0;
+    let sz = mem::size_of::<u64>();
     let mut summation: u64 = 0;
     let mut buf = vec![]; // TODO can we write directly to mmap?
-    while idx < CAP {
-        let val = u64::from(rng.gen::<u8>()); // don't want to overflow...
+    while idx < sender_cap {
+        let val = u64::from(rng.gen::<u8>()) + 1; // don't want to overflow...
+        assert!(val != 0);
         summation += val;
         buf.write_u64::<BigEndian>(val)
             .expect("SERIALIZING THE VAL");
-        SENDER_Q.push(Action::Write {
-            offset: offset,
-            val: val,
-        });
-        for byte in buf.iter().take(8) {
-            mmap[offset] = *byte;
-            offset += 1;
+        let mut control = lock.lock();
+        for byte in buf.iter().take(sz) {
+            mmap[(*control).offset] = *byte;
+            (*control).offset += 1;
         }
         buf.clear();
-        VALUES_TO_READ.fetch_add(1, Ordering::SeqCst);
+        (*control).unflushed_writes += 1;
+        if (*control).unflushed_writes > flush_limit {
+            mmap.flush().expect("could not flush");
+            VALUES_TO_READ.fetch_add((*control).unflushed_writes, Ordering::Relaxed);
+            total_written += (*control).unflushed_writes;;
+            (*control).unflushed_writes = 0;
+        }
         idx += 1;
     }
+    let mut control = lock.lock();
+    mmap.flush().expect("could not flush");
+    total_written += (*control).unflushed_writes;
+    VALUES_TO_READ.fetch_add((*control).unflushed_writes, Ordering::Relaxed);
+    (*control).unflushed_writes = 0;
 
-    summation
+    (total_written as u64, summation)
 }
 
-fn experiment() {
+fn experiment(total_senders: usize, cap: usize) -> ((u64, u64), (u64, u64)) {
+    // reset experimental clean-room conditions
+    VALUES_TO_READ.store(0, Ordering::SeqCst);
     let _ = fs::remove_file(PATH);
 
-    let sender_join = thread::spawn(sender);
-    let receiver_join = thread::spawn(receiver);
+    let sender_cap = cap / total_senders;
+    let sender_lock = sync::Arc::new(Mutex::new(SenderControl {
+        offset: 0,
+        unflushed_writes: 0,
+    }));
 
-    let sender_sum = sender_join.join().unwrap();
-    let receiver_sum = receiver_join.join().unwrap();
-
-    let mut sender_actions: Vec<Action> = Vec::new();
-    while let Some(action) = SENDER_Q.pop() {
-        assert!(action.is_write());
-        if let Err(idx) = sender_actions.binary_search(&action) {
-            sender_actions.insert(idx, action)
-        } else {
-            unreachable!()
-        }
+    let receiver_join = thread::spawn(move || receiver(cap));
+    let mut senders = vec![];
+    for _ in 0..total_senders {
+        let lk = sender_lock.clone();
+        senders.push(thread::spawn(move || sender(cap, sender_cap, lk)))
     }
-    let mut receiver_actions: Vec<Action> = Vec::new();
-    while let Some(action) = RECEIVER_Q.pop() {
-        assert!(action.is_read());
-        if let Err(idx) = receiver_actions.binary_search(&action) {
-            receiver_actions.insert(idx, action)
-        } else {
-            unreachable!()
-        }
-    }
+    drop(sender_lock);
 
-    assert_eq!(sender_actions.len(), receiver_actions.len());
-    for tup in sender_actions.iter().zip(receiver_actions.iter()) {
-        match tup {
-            (
-                &Action::Write {
-                    offset: lo,
-                    val: lv,
-                },
-                &Action::Read {
-                    offset: ro,
-                    val: rv,
-                },
-            ) => {
-                if (lo != ro) || (lv != rv) {
-                    panic!("DIFFERED ON OPERATION PAIR: {:?}", tup);
-                }
-            }
-            _ => unreachable!(),
-        }
+    let mut sender_sum = 0;
+    let mut sender_written = 0;
+    for sender_join in senders {
+        let (indv_send_written, indv_send_sum) = sender_join.join().unwrap();
+        sender_sum += indv_send_sum;
+        sender_written += indv_send_written;
     }
+    let rcv = receiver_join.join().unwrap();
 
+    (rcv, (sender_written, sender_sum))
+}
+
+fn validate(rcv: (u64, u64), snd: (u64, u64)) -> () {
+    let (receiver_read, receiver_sum) = rcv;
+    let (sender_written, sender_sum) = snd;
+
+    assert_eq!(receiver_read, sender_written);
+
+    assert!(sender_sum >= receiver_sum);
     assert_eq!(sender_sum, receiver_sum);
 }
 
@@ -202,7 +184,105 @@ fn main() {
     // systems.
     assert_eq!(mem::size_of::<usize>(), mem::size_of::<u64>());
 
-    loop {
-        experiment()
+    let matches = App::new("mmap_comm")
+        .arg(
+            Arg::with_name("total_writes")
+                .long("total_writes")
+                .value_name("INT")
+                .help("maximum values to write to the mmap'ed file")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("total_senders")
+                .long("total_senders")
+                .value_name("INT")
+                .help("total number of sender threads to use")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("max_experiments")
+                .long("max_experiments")
+                .value_name("INT")
+                .help("maximum number of experiments to run")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("duration")
+                .long("duration")
+                .value_name("INT")
+                .help("length of time in seconds to run experiments for")
+                .takes_value(true),
+        )
+        .group(
+            ArgGroup::with_name("experimental_controls")
+                .args(&["duration", "max_experiments"])
+                .required(true),
+        )
+        .get_matches();
+
+    let mut successes = 0;
+    let mut failures = 0;
+    let mut times = CKMS::new(0.001);
+
+    let cap = usize::from_str(matches.value_of("total_writes").unwrap()).unwrap();
+    let total_senders = usize::from_str(matches.value_of("total_senders").unwrap()).unwrap();
+    let start = time::Instant::now();
+
+    if let Some(max_experiments) = matches.value_of("max_experiments") {
+        let mut max_experiments = usize::from_str(max_experiments).unwrap();
+        while max_experiments > 0 {
+            let result = panic::catch_unwind(|| {
+                let now = time::Instant::now();
+                let (recv, snd) = experiment(total_senders, cap);
+                let elapsed = now.elapsed();
+                validate(recv, snd);
+                elapsed
+            });
+            if let Ok(elapsed) = result {
+                times.insert(
+                    (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000_000_000.0),
+                );
+                successes += 1;
+            } else {
+                failures += 1;
+            }
+            max_experiments -= 1;
+        }
+    } else if let Some(duration) = matches.value_of("duration") {
+        let limit = time::Duration::from_secs(u64::from_str(duration).unwrap());
+        loop {
+            let result = panic::catch_unwind(|| {
+                let now = time::Instant::now();
+                let (recv_sum, snd_sum) = experiment(total_senders, cap);
+                let elapsed = now.elapsed();
+                validate(recv_sum, snd_sum);
+                elapsed
+            });
+            if let Ok(elapsed) = result {
+                times.insert(
+                    (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000_000_000.0),
+                );
+                successes += 1;
+            } else {
+                failures += 1;
+            }
+            if start.elapsed() > limit {
+                break;
+            }
+        }
+    } else {
+        println!("Oops please give duration or max_experiments");
+        unreachable!()
     }
+
+    println!("FAILURES: {}", failures);
+    println!("SUCCESSES: {}", successes);
+    println!("ELAPSED: {:?}", start.elapsed());
+    println!("TIMES (of {}): ", times.count());
+    println!("    MIN: {:.4}", times.query(0.0).unwrap().1);
+    println!("    AVG: {:.4}", times.cma().unwrap());
+    println!("    0.75: {:.4}", times.query(0.75).unwrap().1);
+    println!("    0.90: {:.4}", times.query(0.90).unwrap().1);
+    println!("    0.95: {:.4}", times.query(0.95).unwrap().1);
+    println!("    MAX: {:.4}", times.query(1.0).unwrap().1);
 }
